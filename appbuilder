@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""appbuilder — build lynxOS app bundles from source.
+
+An app is a macOS-style bundle directory, `<Name>.app/`, with a JSON
+manifest (no plist on lynxOS — see docs/bundle-format.md):
+
+    MyApp.app/
+      Contents/Info.json          the manifest (compiled from App.toml)
+      Contents/Resources/         icon and other read-only app files
+      Contents/lynxOS/MyApp       the executable
+
+Usage:
+  appbuilder init MyApp [--id com.example.myapp] [--name "My App"]
+  appbuilder build [PROJECT] [--out OUT]
+  appbuilder check (PROJECT | MyApp.app)
+  appbuilder clean [PROJECT]
+  appbuilder -h | --help
+
+A project is a directory with an `App.toml` (the authoring config), a
+`Sources/` tree and a `Resources/` tree. `build` compiles Sources/ with
+the command in App.toml (cc by default), then assembles the bundle and
+writes the compiled manifest, `Contents/Info.json`.
+
+python3 stdlib only (tomllib, 3.11+).
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import zlib
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # py<3.11
+    sys.exit("appbuilder: python 3.11+ is required (tomllib)")
+
+HERE = Path(__file__).resolve().parent
+
+REQUIRED_KEYS = ("name", "identifier", "version", "build", "executable")
+ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
+VERSION_RE = re.compile(r"^\d+\.\d+(\.\d+)?$")
+NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*$")
+
+
+def log(msg):
+    print(f"\033[1;32m==>\033[0m {msg}", flush=True)
+
+
+def warn(msg):
+    print(f"\033[1;33m==> WARNING:\033[0m {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg):
+    print(f"\033[1;31m==> ERROR:\033[0m {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+# --------------------------------------------------------------------------
+# project configuration (App.toml)
+
+
+class Config:
+    def __init__(self, path):
+        self.path = path
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            die(f"{path}: invalid TOML: {e}")
+        bundle = data.get("bundle")
+        if not isinstance(bundle, dict):
+            die(f"{path}: missing [bundle] section")
+        self.bundle = bundle
+        self.build = data.get("build", {})
+        self.info = data.get("info", {})  # extra keys, copied into Info.json
+        for k in REQUIRED_KEYS:
+            if k not in bundle:
+                die(f"{path}: [bundle] is missing '{k}'")
+
+    # convenience accessors with validation
+    @property
+    def name(self):
+        return self._re("name", NAME_RE, "bundle name")
+
+    @property
+    def display_name(self):
+        return str(self.bundle.get("display_name", self.name))
+
+    @property
+    def identifier(self):
+        return self._re("identifier", ID_RE, "reverse-DNS identifier")
+
+    @property
+    def version(self):
+        return self._re("version", VERSION_RE, "version (x.y[.z])")
+
+    @property
+    def build_number(self):
+        b = self.bundle["build"]
+        if not isinstance(b, int) or b < 1:
+            die(f"{self.path}: [bundle] build must be an integer >= 1")
+        return b
+
+    @property
+    def executable(self):
+        return self._re("executable", NAME_RE, "executable name")
+
+    @property
+    def icon(self):
+        return self.bundle.get("icon", "AppIcon.png")
+
+    def _re(self, key, rx, what):
+        v = self.bundle[key]
+        if not isinstance(v, str) or not rx.match(v):
+            die(f"{self.path}: [bundle] {key} is not a valid {what}: {v!r}")
+        return v
+
+    def build_command(self):
+        cmd = self.build.get("command")
+        if not cmd:
+            cmd = ["cc", "-O2", "-std=c11", "-o", "{out}", "Sources/main.c"]
+        if not isinstance(cmd, list) or not all(isinstance(a, str) for a in cmd):
+            die(f"{self.path}: [build] command must be a list of strings")
+        if not any("{out}" in a for a in cmd):
+            die(f"{self.path}: [build] command needs an {{out}} placeholder "
+                "for the executable to produce")
+        return cmd
+
+    def info_dict(self):
+        out = {
+            "CFBundleName": self.name,
+            "CFBundleDisplayName": self.display_name,
+            "CFBundleIdentifier": self.identifier,
+            "CFBundleShortVersionString": self.version,
+            "CFBundleVersion": self.build_number,
+            "CFBundleExecutable": self.executable,
+            "CFBundlePackageType": "APPL",
+            "CFBundleInfoDictionaryVersion": "6.0",
+        }
+        if self.icon:
+            out["CFBundleIconFile"] = self.icon
+        for k, v in self.info.items():
+            if k in out:
+                warn(f"{self.path}: [info] '{k}' overrides a standard key")
+            out[k] = v
+        return out
+
+
+def find_project(path):
+    p = Path(path or ".").resolve()
+    if (p / "App.toml").is_file():
+        return p
+    die(f"no App.toml in {p} — is this an appbuilder project?")
+
+
+# --------------------------------------------------------------------------
+# init
+
+
+def placeholder_icon(path):
+    """128x128 RGBA PNG: full-bleed #BFBFBF with a rounded darker square —
+    a stand-in until real art lands (stdlib-only PNG writer)."""
+    W = H = 128
+    R, G, B = 191, 191, 191
+    bg = bytes((R, G, B, 255))
+    tile, size, rad = 0x58, 72, 14  # #585858-ish, 72px square, 14px radius
+    px = bytearray(bg * (W * H))
+    x0 = y0 = (W - size) // 2
+    for yy in range(y0, y0 + size):
+        for xx in range(x0, x0 + size):
+            dx = min(xx - x0, x0 + size - 1 - xx)
+            dy = min(yy - y0, y0 + size - 1 - yy)
+            if dx + dy >= rad or (dx >= rad and dy >= rad):
+                i = (yy * W + xx) * 4
+                px[i:i + 4] = bytes((tile, tile, tile, 255))
+    raw = b"".join(b"\x00" + bytes(px[y * W * 4:(y + 1) * W * 4])
+                   for y in range(H))
+    png = b"\x89PNG\r\n\x1a\n"
+    for tag, data in ((b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 6, 0, 0, 0)),
+                      (b"IDAT", zlib.compress(raw, 9)), (b"IEND", b"")):
+        png += struct.pack(">I", len(data)) + tag + data
+        png += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    path.write_bytes(png)
+
+
+def main_c_template(cfg):
+    return f"""\
+/* {cfg.name} — a lynxOS app. */
+#include <stdio.h>
+
+int main(int argc, char **argv)
+{{
+    (void)argc;
+    (void)argv;
+    printf("{cfg.display_name} {cfg.version} (build {cfg.build_number})"
+           " — running on lynxOS\\n");
+    return 0;
+}}
+"""
+
+
+def toml_template(args, cfg):
+    name = f'"{cfg.name}"'
+    disp = f'"{args.name}"' if args.name else name
+    return f"""\
+# {cfg.name} — appbuilder project configuration.
+# Authoring format; `appbuilder build` compiles this into the bundle's
+# Contents/Info.json (see docs/bundle-format.md).
+
+[bundle]
+name = {name}                       # the bundle: {cfg.name}.app
+display_name = {disp}
+identifier = "{cfg.identifier}"     # reverse-DNS; key for storage/settings
+version = "{cfg.version}"
+build = {cfg.build_number}                        # bump for every new install over an old one
+executable = "{cfg.executable}"     # ends up at Contents/lynxOS/
+icon = "{cfg.icon}"                 # inside Resources/
+
+[build]
+# Run in the project dir; {{out}} is the executable to produce.
+command = ["cc", "-O2", "-std=c11", "-o", "{{out}}", "Sources/main.c"]
+
+[info]
+# Extra keys, copied verbatim into Contents/Info.json:
+# windowSize = [640, 400]
+# minimumSystem = "0.1"
+"""
+
+
+def do_init(args):
+    name = re.sub(r"[^A-Za-z0-9._-]", "", args.name or args.project)
+    if not name or not NAME_RE.match(name):
+        die(f"invalid project/bundle name: {args.name!r}")
+    ident = args.id or f"com.example.{name.lower()}"
+    proj = Path(args.project).resolve()
+    if proj.exists() and any(proj.iterdir()):
+        die(f"{proj} already exists and is not empty")
+    proj.mkdir(parents=True)
+
+    cfg = Config.__new__(Config)  # fill without parsing a file
+    cfg.path = proj / "App.toml"
+    cfg.bundle = {
+        "name": name,
+        "display_name": args.name or name,
+        "identifier": ident,
+        "version": "0.1.0",
+        "build": 1,
+        "executable": name,
+        "icon": "AppIcon.png",
+    }
+    cfg.build = {}
+    cfg.info = {}
+
+    (proj / "App.toml").write_text(toml_template(args, cfg))
+    (proj / "Sources").mkdir()
+    (proj / "Sources" / "main.c").write_text(main_c_template(cfg))
+    (proj / "Resources").mkdir()
+    placeholder_icon(proj / "Resources" / cfg.icon)
+    (proj / ".gitignore").write_text("out/\n*.o\n")
+
+    log(f"Created {cfg.name} at {proj}")
+    print(f"""
+  {cfg.name}/
+    App.toml             project config (the only file you must keep)
+    Sources/main.c       hello-world to replace with your app
+    Resources/{cfg.icon}  placeholder icon — replace with real art
+
+Next:
+  cd {args.project}
+  appbuilder build          # -> out/{cfg.name}.app
+  appbuilder check out/{cfg.name}.app
+""")
+
+
+# --------------------------------------------------------------------------
+# build
+
+
+def copy_resources(src, dst):
+    if not src.is_dir():
+        return
+    for f in sorted(src.rglob("*")):
+        rel = f.relative_to(src)
+        if f.is_symlink():
+            warn(f"skipping symlink in Resources/: {rel}")
+            continue
+        target = dst / rel
+        if f.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, target)
+            os.chmod(target, 0o644)
+
+
+def do_build(args):
+    proj = find_project(args.project)
+    cfg = Config(proj / "App.toml")
+    out = Path(args.out).resolve() if args.out else proj / "out"
+    bundle = out / f"{cfg.name}.app"
+    contents = bundle / "Contents"
+
+    if bundle.exists():
+        shutil.rmtree(bundle)
+    (contents / "Resources").mkdir(parents=True)
+    (contents / "lynxOS").mkdir(parents=True)
+
+    # compile straight into the bundle
+    exe = contents / "lynxOS" / cfg.executable
+    cmd = [a.replace("{out}", str(exe)) for a in cfg.build_command()]
+    log(f"Compiling {cfg.name} {cfg.version} (build {cfg.build_number})")
+    print(f"\033[0;36m  {' '.join(cmd)}\033[0m", file=sys.stderr, flush=True)
+    try:
+        r = subprocess.run(cmd, cwd=str(proj))
+    except FileNotFoundError:
+        die(f"'{cmd[0]}' not found on the host")
+    if r.returncode != 0:
+        die(f"build command failed (rc={r.returncode})")
+
+    info = cfg.info_dict()
+    (contents / "Info.json").write_text(
+        json.dumps(info, indent=2, sort_keys=True) + "\n")
+    copy_resources(proj / "Resources", contents / "Resources")
+
+    # the exe must be executable whatever umask the compiler was run under
+    os.chmod(exe, 0o755)
+
+    log(f"Built {bundle}")
+    check_bundle(bundle, cfg=cfg, quiet=True)
+    log("check: bundle is valid")
+
+
+def do_check(args):
+    target = Path(args.project).resolve()
+    if target.name.endswith(".app") or (target / "Contents").is_dir():
+        check_bundle(target)
+        log(f"check: {target} is valid")
+        return
+    proj = find_project(args.project)
+    cfg = Config(proj / "App.toml")  # validates schema
+    icon = proj / "Resources" / cfg.icon
+    if cfg.icon and not icon.is_file():
+        die(f"Resources/{cfg.icon} is missing (set in [bundle] icon)")
+    if cfg.icon and icon.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
+        warn(f"Resources/{cfg.icon} is not a PNG")
+    cmd = cfg.build_command()
+    log(f"check: {proj} looks like a valid appbuilder project")
+
+
+def do_clean(args):
+    proj = find_project(args.project)
+    out = proj / "out"
+    if out.is_dir():
+        shutil.rmtree(out)
+    log(f"cleaned {out}")
+
+
+# --------------------------------------------------------------------------
+# check (bundle)
+
+
+def check_bundle(bundle, cfg=None, quiet=False):
+    contents = bundle / "Contents"
+    if not contents.is_dir():
+        die(f"{bundle}: not an app bundle (no Contents/)")
+    if not any(p.name == "lynxOS" for p in contents.iterdir()):
+        die(f"{contents}: missing lynxOS/ (the executable's home)")
+
+    info_path = contents / "Info.json"
+    if not info_path.is_file():
+        die(f"{contents}: missing Info.json")
+    try:
+        info = json.loads(info_path.read_text())
+    except json.JSONDecodeError as e:
+        die(f"{info_path}: invalid JSON: {e}")
+    for k in ("CFBundleName", "CFBundleIdentifier", "CFBundleExecutable",
+              "CFBundleShortVersionString", "CFBundleVersion"):
+        if k not in info:
+            die(f"{info_path}: missing required key '{k}'")
+    if not ID_RE.match(str(info["CFBundleIdentifier"])):
+        die(f"{info_path}: CFBundleIdentifier is not reverse-DNS: "
+            f"{info['CFBundleIdentifier']!r}")
+
+    exe = contents / "lynxOS" / str(info["CFBundleExecutable"])
+    if not exe.is_file():
+        die(f"missing executable: {exe}")
+    if not os.access(exe, os.X_OK):
+        die(f"{exe} is not executable")
+    if exe.read_bytes()[:4] != b"\x7fELF":
+        die(f"{exe} is not an ELF binary")
+
+    icon = info.get("CFBundleIconFile")
+    if icon:
+        ipath = contents / "Resources" / icon
+        if not ipath.is_file():
+            die(f"missing icon: {ipath}")
+        if ipath.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
+            warn(f"{ipath} is not a PNG")
+
+    if cfg is not None:  # built just now: manifest must match App.toml
+        expect = cfg.info_dict()
+        if info != expect:
+            die("Info.json does not match App.toml — rebuild")
+
+    if not quiet:
+        known = {"Info.json", "Resources", "lynxOS"}
+        for p in contents.iterdir():
+            if p.name not in known:
+                warn(f"unexpected entry in Contents/: {p.name}")
+
+
+# --------------------------------------------------------------------------
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="appbuilder", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="create a new app project")
+    p.add_argument("project")
+    p.add_argument("--id", help="reverse-DNS bundle identifier")
+    p.add_argument("--name", help="display name (defaults to the project name)")
+
+    p = sub.add_parser("build", help="compile and assemble the bundle")
+    p.add_argument("project", nargs="?", default=".")
+    p.add_argument("--out", help="output dir (default: PROJECT/out)")
+
+    p = sub.add_parser("check", help="validate a project or a built bundle")
+    p.add_argument("project", nargs="?", default=".")
+
+    p = sub.add_parser("clean", help="remove the project's out/")
+    p.add_argument("project", nargs="?", default=".")
+
+    args = ap.parse_args()
+    {"init": do_init, "build": do_build,
+     "check": do_check, "clean": do_clean}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
