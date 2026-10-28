@@ -124,7 +124,9 @@ class Config:
     def build_command(self):
         cmd = self.build.get("command")
         if not cmd:
-            cmd = ["cc", "-O2", "-std=c11", "-o", "{out}", "Sources/main.c"]
+            cmd = ["sh", "-c", "g++ -O2 -fPIC -std=c++17 -o {out} "
+                   "Sources/main.cpp Sources/AppKit.cpp "
+                   "$(pkg-config --cflags --libs Qt6Widgets x11)"]
         if not isinstance(cmd, list) or not all(isinstance(a, str) for a in cmd):
             die(f"{self.path}: [build] command must be a list of strings")
         if not any("{out}" in a for a in cmd):
@@ -189,48 +191,24 @@ def placeholder_icon(path):
     path.write_bytes(png)
 
 
-def main_c_template(cfg):
-    return f"""\
-/* {cfg.name} — a lynxOS app. */
-#include <stdio.h>
-
-int main(int argc, char **argv)
-{{
-    (void)argc;
-    (void)argv;
-    printf("{cfg.display_name} {cfg.version} (build {cfg.build_number})"
-           " — running on lynxOS\\n");
-    return 0;
-}}
-"""
+def _template(name):
+    """A file from templates/gui/ (vendored next to this script)."""
+    return (HERE / "templates" / "gui" / name).read_text()
 
 
 def toml_template(args, cfg):
-    name = f'"{cfg.name}"'
-    disp = f'"{args.name}"' if args.name else name
-    return f"""\
-# {cfg.name} — appbuilder project configuration.
-# Authoring format; `appbuilder build` compiles this into the bundle's
-# Contents/Info.json (see docs/bundle-format.md).
-
-[bundle]
-name = {name}                       # the bundle: {cfg.name}.app
-display_name = {disp}
-identifier = "{cfg.identifier}"     # reverse-DNS; key for storage/settings
-version = "{cfg.version}"
-build = {cfg.build_number}                        # bump for every new install over an old one
-executable = "{cfg.executable}"     # ends up at Contents/lynxOS/
-icon = "{cfg.icon}"                 # inside Resources/
-
-[build]
-# Run in the project dir; {{out}} is the executable to produce.
-command = ["cc", "-O2", "-std=c11", "-o", "{{out}}", "Sources/main.c"]
-
-[info]
-# Extra keys, copied verbatim into Contents/Info.json:
-# windowSize = [640, 400]
-# minimumSystem = "0.1"
-"""
+    import datetime
+    t = _template("App.toml")
+    subs = {
+        "{{NAME}}": cfg.name,
+        "{{DISPLAY}}": cfg.display_name,
+        "{{ID}}": cfg.identifier,
+        "{{VERSION}}": cfg.version,
+        "{{YEAR}}": str(datetime.date.today().year),
+    }
+    for k, v in subs.items():
+        t = t.replace(k, v)
+    return t
 
 
 def do_init(args):
@@ -259,7 +237,13 @@ def do_init(args):
 
     (proj / "App.toml").write_text(toml_template(args, cfg))
     (proj / "Sources").mkdir()
-    (proj / "Sources" / "main.c").write_text(main_c_template(cfg))
+    (proj / "Sources" / "main.cpp").write_text(
+        _template("main.cpp").replace("{{DISPLAY_NAME}}", cfg.display_name))
+    # AppKit — the 10.6-style GUI framework on Qt 6, vendored so that
+    # `appbuilder build` works with nothing installed. The canonical
+    # copy lives in the AppKit repo; refresh these when it changes.
+    for f in ("AppKit.h", "AppKit.cpp"):
+        (proj / "Sources" / f).write_text(_template(f))
     (proj / "Resources").mkdir()
     placeholder_icon(proj / "Resources" / cfg.icon)
     (proj / ".gitignore").write_text("out/\n*.o\n")
@@ -267,13 +251,16 @@ def do_init(args):
     log(f"Created {cfg.name} at {proj}")
     print(f"""
   {cfg.name}/
-    App.toml             project config (the only file you must keep)
-    Sources/main.c       hello-world to replace with your app
-    Resources/{cfg.icon}  placeholder icon — replace with real art
+    App.toml              project config (the only file you must keep)
+    Sources/main.cpp      GUI app on AppKit — window, File menu with
+                          "About {cfg.display_name}", an NSAlert demo
+    Sources/AppKit.h      the AppKit framework (vendored; canonical copy
+    Sources/AppKit.cpp    in the AppKit repo)
+    Resources/{cfg.icon}   placeholder icon — replace with real art
 
 Next:
   cd {args.project}
-  appbuilder build          # -> out/{cfg.name}.app
+  appbuilder build          # -> out/{cfg.name}.app  (needs Qt 6 + pkg-config)
   appbuilder check out/{cfg.name}.app
 """)
 

@@ -22,9 +22,13 @@ appbuilder build            # -> out/MyApp.app
 appbuilder check out/MyApp.app
 ```
 
-`init` scaffolds a project: `App.toml`, a hello-world `Sources/main.c`, a
-placeholder `Resources/AppIcon.png` (128×128 PNG, stdlib-only writer — swap
-in real art), and a project `.gitignore`.
+`init` scaffolds a GUI project on [AppKit](https://github.com/lynxOSX/AppKit)
+(the 10.6-SDK-style framework on Qt 6): `App.toml`, `Sources/main.cpp` (a
+window, a File menu with "About <App>", an NSAlert demo), the vendored
+`Sources/AppKit.h` / `Sources/AppKit.cpp` so `build` works with nothing
+installed, a placeholder `Resources/AppIcon.png` (128×128 PNG, stdlib-only
+writer — swap in real art), and a project `.gitignore`. The build needs Qt 6
+Widgets + `pkg-config`; `-fPIC` is required when linking against Qt 6.
 
 `build` compiles with the `[build] command` from `App.toml` (`{out}` is the
 executable to produce), then assembles the bundle, writes `Contents/Info.json`
@@ -49,9 +53,11 @@ ln -s "$PWD/appbuilder" ~/.local/bin/appbuilder
 | | |
 |---|---|
 | `appbuilder` | the tool (init/build/check/clean) |
+| `templates/gui/` | the GUI scaffold (AppKit vendored: AppKit.h/cpp, main.cpp, App.toml) |
 | `docs/bundle-format.md` | the `.app` format, Info.json keys, App.toml reference |
 
 ## Related
 
+- `lynxOSX/AppKit` — the framework vendored into GUI scaffolds (canonical copy)
 - `lynxOSX/rootFSBuilder` — creates the rootfs, including `/Applications`
 - `lynxOSX/lynxOS` — the distro these bundles install into

@@ -1,0 +1,26 @@
+# {{NAME}} — appbuilder project configuration.
+# Authoring format; `appbuilder build` compiles this into the bundle's
+# Contents/Info.json (see docs/bundle-format.md).
+
+[bundle]
+name = "{{NAME}}"                   # the bundle: {{NAME}}.app
+display_name = "{{DISPLAY}}"
+identifier = "{{ID}}"     # reverse-DNS; key for storage/settings
+version = "{{VERSION}}"
+build = 1                        # bump for every new install over an old one
+executable = "{{NAME}}"     # ends up at Contents/lynxOS/
+icon = "AppIcon.png"                 # inside Resources/
+
+[build]
+# Run in the project dir; {out} is the executable to produce.
+# AppKit (the 10.6-style framework on Qt 6) is vendored in Sources/;
+# -fPIC is required when linking against Qt 6.
+command = ["sh", "-c",
+  "g++ -O2 -fPIC -std=c++17 -o {out} Sources/main.cpp Sources/AppKit.cpp $(pkg-config --cflags --libs Qt6Widgets x11)"]
+
+[info]
+# Extra keys, copied verbatim into Contents/Info.json. The standard
+# about panel reads NSHumanReadableCopyright and (below the app name)
+# NSApplicationDescription:
+NSApplicationDescription = "A lynxOS app"
+NSHumanReadableCopyright = "© {{YEAR}} {{DISPLAY}} — a lynxOS app"
