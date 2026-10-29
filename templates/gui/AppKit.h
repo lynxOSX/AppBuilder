@@ -59,10 +59,28 @@ public:
 
     void activateIgnoringOtherApps();
 
+    /* ---- the system menu bar (SystemUIServer) ---- */
+
+    /*! The app menu shown bold at the left of the bar ("About <App>",
+        "Quit <App>"). AppKit builds that one automatically; replace it
+        with your own (10.6's NSApplication setApplicationMenu:). It is
+        published to the system menu bar with the window's menus. */
+    void setApplicationMenu(class NSMenu *menu);
+    class NSMenu *applicationMenu() const { return appMenu_; }
+
+    /*! Make this app the menu bar's DEFAULT — what the bar shows when
+        no window is active, like macOS falls back to Finder. Pass a
+        menu for an extra titled menu (File, ...) or nullptr to just
+        publish the app menu; call with `nullptr` again to withdraw
+        (NSMenu::setDefaultApplicationMenu(nullptr) clears). Windowless
+        apps (file managers) publish this way instead. */
+    void setDefaultApplicationMenu(class NSMenu *menu = nullptr);
+
 private:
     NSApplication(int &argc, char **argv);
     static NSApplication *shared_;
     QString name_;
+    class NSMenu *appMenu_ = nullptr;
 };
 
 /* ------------------------------------------------------------------ */
@@ -107,12 +125,17 @@ public:
     NSMenu *submenu() const { return submenu_; }
     QString title() const { return title_; }
 
+    /*! Greyed-out items publish as disabled and don't trigger. */
+    void setEnabled(bool enabled);
+    bool isEnabled() const { return enabled_; }
+
 private:
     friend class NSMenu;
     QString title_;
     std::function<void()> action_;
     QString key_;
     NSMenu *submenu_;
+    bool enabled_ = true;
 };
 
 class NSMenu {

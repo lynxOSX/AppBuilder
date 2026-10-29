@@ -42,13 +42,21 @@ int main()
         alert->runModal();
     });
 
-    /* the File menu, macOS style */
-    NSMenu *file = new NSMenu("File");
-    file->addItem(new NSMenuItem("About {{DISPLAY_NAME}}",
+    /* The system menu bar shows the frontmost app's menus. The app menu
+       (bold, left of File) carries About and Quit; the File menu holds
+       the app's own commands. */
+    NSMenu *appMenu = new NSMenu("{{DISPLAY_NAME}}");
+    appMenu->addItem(new NSMenuItem("About {{DISPLAY_NAME}}",
         [app] { app->orderFrontStandardAboutPanel(); }));
-    file->addSeparator();
-    file->addItem(new NSMenuItem("Quit {{DISPLAY_NAME}}",
+    appMenu->addSeparator();
+    appMenu->addItem(new NSMenuItem("Quit {{DISPLAY_NAME}}",
         [app] { exit(0); }, "Ctrl+Q"));
+    app->setApplicationMenu(appMenu);
+
+    NSMenu *file = new NSMenu("File");
+    file->addItem(new NSMenuItem("New Window", [] {}, "Ctrl+N"));
+    file->addSeparator();
+    file->addItem(new NSMenuItem("Close Window", [] {}, "Ctrl+W"));
     win->setMainMenu(file);
 
     win->makeKeyAndOrderFront();

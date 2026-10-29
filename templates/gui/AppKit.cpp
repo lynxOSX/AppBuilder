@@ -13,6 +13,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFrame>
+#include <QAbstractNativeEventFilter>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
@@ -25,6 +27,9 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QVariant>
+#include <QtGui/qguiapplication_platform.h>
+
+#include <xcb/xcb.h>
 
 #include <unistd.h>
 #include <limits.h>
@@ -134,6 +139,169 @@ void NSSetWindowCompactTitlebar(QWidget *widget, bool compact)
 }
 
 /* ------------------------------------------------------------------ */
+/* The system menu bar (SystemUIServer)                               */
+/*                                                                    */
+/* Apps PUBLISH their menus; the bar renders whatever the frontmost   */
+/* app published — nothing is hardcoded in the bar. Two channels:     */
+/*                                                                    */
+/*   _LYNX_GLOBAL_MENU  UTF8_STRING on every app window that has a    */
+/*                      main menu; the active window wins.            */
+/*   _LYNX_DEFAULT_MENU UTF8_STRING on the root window — the default  */
+/*                      app's menus (the Finder-clone fallback), what */
+/*                      the bar shows when no window is active.       */
+/*                                                                    */
+/* Both hold JSON:                                                    */
+/*   { "appName": "Finder",                                           */
+/*     "appMenu": [ { "id": 1, "title": "About Finder" } ],           */
+/*     "menus":  [ { "title": "File", "items": [ ... ] } ] }          */
+/* Items: { "id": n, "title": t, "key": "Ctrl+Q", "enabled": false,   */
+/*          "submenu": [...] } or { "sep": true }.                    */
+/*                                                                    */
+/* Activation goes back the same way: SystemUIServer sends a          */
+/* ClientMessage of type _LYNX_MENU_ACTION (format 32, data.l[0] =    */
+/* the item id) to the window — or to the root for the default app,   */
+/* which must XSelectInput(root, StructureNotifyMask) to receive it.  */
+/* The dispatch map below triggers the matching QAction.              */
+
+static QHash<int, QAction *> g_menuItemsById;
+static int g_nextMenuItemId = 1;
+
+static QString lynxAppName()
+{
+    QString name = NSApplication::sharedApplication()->applicationName();
+    if (name.isEmpty())
+        name = QCoreApplication::applicationName();
+    if (name.isEmpty())
+        name = QFileInfo(QCoreApplication::applicationFilePath())
+                   .completeBaseName();
+    return name;
+}
+
+static QJsonObject lynxSerializeAction(QAction *a)
+{
+    QJsonObject o;
+    const int id = g_nextMenuItemId++;
+    g_menuItemsById.insert(id, a);
+    o["id"] = id;
+    o["title"] = a->text();
+    if (!a->shortcut().isEmpty())
+        o["key"] = a->shortcut().toString();
+    if (!a->isEnabled())
+        o["enabled"] = false;
+    return o;
+}
+
+static QJsonArray lynxSerializeItems(const QList<QAction *> &actions)
+{
+    QJsonArray items;
+    for (QAction *a : actions) {
+        if (a->isSeparator()) {
+            items.append(QJsonObject{ {"sep", true} });
+        } else if (QMenu *sub = a->menu()) {
+            QJsonObject o;
+            o["title"] = a->text();
+            o["submenu"] = lynxSerializeItems(sub->actions());
+            items.append(o);
+        } else {
+            items.append(lynxSerializeAction(a));
+        }
+    }
+    return items;
+}
+
+/* The app menu every app gets until it replaces one: About + Quit. */
+static NSMenu *lynxDefaultAppMenu()
+{
+    NSApplication *app = NSApplication::sharedApplication();
+    NSMenu *m = new NSMenu(lynxAppName());
+    m->addItem(new NSMenuItem(QObject::tr("About %1").arg(lynxAppName()),
+        [app] { app->orderFrontStandardAboutPanel(); }));
+    m->addSeparator();
+    m->addItem(new NSMenuItem(QObject::tr("Quit %1").arg(lynxAppName()),
+        [] { QApplication::quit(); }, "Ctrl+Q"));
+    return m;
+}
+
+/* menus: (title, items) pairs — a window bar's titled menus, or the
+   single default-application menu */
+static QByteArray
+lynxSerializeMenu(const QList<QAction *> &appMenuItems,
+                  const QVector<QPair<QString, QList<QAction *>>> &menus)
+{
+    QJsonObject root;
+    root["appName"] = lynxAppName();
+
+    QJsonArray appMenu;
+    for (QAction *a : appMenuItems)
+        appMenu.append(a->isSeparator() ? QJsonObject{ {"sep", true} }
+                                        : lynxSerializeAction(a));
+    root["appMenu"] = appMenu;
+
+    QJsonArray jsonMenus;
+    for (const auto &menu : menus) {
+        QJsonObject m;
+        m["title"] = menu.first;
+        m["items"] = lynxSerializeItems(menu.second);
+        jsonMenus.append(m);
+    }
+    root["menus"] = jsonMenus;
+
+    return QJsonDocument(root).toJson(QJsonDocument::Compact);
+}
+
+static Display *lynxXDisplay()
+{
+    /* a private Xlib connection for the property writes; the atoms are
+       server-side, so they match the numbers Qt's xcb events carry */
+    return XOpenDisplay(nullptr);
+}
+
+static Atom lynxAtom(const char *name)
+{
+    static QHash<QString, Atom> cache;
+    if (!cache.contains(name)) {
+        if (Display *d = XOpenDisplay(nullptr)) {
+            cache.insert(name, XInternAtom(d, name, False));
+            XCloseDisplay(d);
+        }
+    }
+    return cache.value(name);
+}
+
+static void lynxPublish(const Atom atom, const Window win,
+                        const QByteArray &json)
+{
+    if (Display *d = lynxXDisplay()) {
+        const Atom utf8 = XInternAtom(d, "UTF8_STRING", False);
+        XChangeProperty(d, win, atom, utf8, 8, PropModeReplace,
+                        (const unsigned char *)json.constData(),
+                        json.size());
+        XCloseDisplay(d);
+    }
+}
+
+/* ---- dispatch: SystemUIServer's _LYNX_MENU_ACTION ClientMessages --- */
+
+class LynxMenuActionFilter : public QAbstractNativeEventFilter {
+public:
+    bool nativeEventFilter(const QByteArray &type, void *message,
+                           qintptr *) override
+    {
+        if (type != "xcb_generic_event_t") return false;
+        auto *ev = static_cast<xcb_generic_event_t *>(message);
+        if ((ev->response_type & 0x7f) != XCB_CLIENT_MESSAGE) return false;
+        auto *cm = reinterpret_cast<xcb_client_message_event_t *>(ev);
+        if (cm->format != 32 || cm->type != lynxAtom("_LYNX_MENU_ACTION"))
+            return false;
+        if (QAction *a = g_menuItemsById.value(cm->data.data32[0])) {
+            a->trigger();
+            return true;
+        }
+        return false;
+    }
+};
+
+/* ------------------------------------------------------------------ */
 /* NSApplication                                                      */
 
 NSApplication *NSApplication::shared_ = nullptr;
@@ -154,6 +322,8 @@ NSApplication *NSApplication::sharedApplication()
         (void)new QApplication(dummy_argc, dummy_argv);
         QApplication::setQuitOnLastWindowClosed(true);
         shared_ = new NSApplication(dummy_argc, dummy_argv);
+        static LynxMenuActionFilter menuFilter;
+        qApp->installNativeEventFilter(&menuFilter);
         shared_->setApplicationName(
             NSBundle::mainBundle()
                 ->objectForInfoDictionaryKey("CFBundleDisplayName")
@@ -182,6 +352,38 @@ QString NSApplication::applicationName() const
 void NSApplication::activateIgnoringOtherApps()
 {
     /* Qt raises all windows by default; nothing to do on lynxOS. */
+}
+
+void NSApplication::setApplicationMenu(NSMenu *menu)
+{
+    appMenu_ = menu;
+}
+
+void NSApplication::setDefaultApplicationMenu(NSMenu *menu)
+{
+    Display *d = lynxXDisplay();
+    if (!d) return;
+    const Window root = DefaultRootWindow(d);
+    if (!menu) {
+        XDeleteProperty(d, root, lynxAtom("_LYNX_DEFAULT_MENU"));
+        XCloseDisplay(d);
+        return;
+    }
+    const QByteArray json = lynxSerializeMenu(
+        appMenu_ ? appMenu_->qtActions()
+                 : lynxDefaultAppMenu()->qtActions(),
+        { qMakePair(menu->title(), menu->qtActions()) });
+    lynxPublish(lynxAtom("_LYNX_DEFAULT_MENU"), root, json);
+    /* stamp our PID so SystemUIServer can drop the fallback when this
+       app dies without cleaning up (a crash leaves the property) */
+    const unsigned long pid = static_cast<unsigned long>(getpid());
+    XChangeProperty(d, root, lynxAtom("_LYNX_DEFAULT_MENU_PID"),
+                    XA_CARDINAL, 32, PropModeReplace,
+                    (const unsigned char *)&pid, 1);
+    /* receive the activation ClientMessages on the root (SystemUIServer
+       sends with event_mask = StructureNotifyMask) */
+    XSelectInput(d, root, StructureNotifyMask);
+    XCloseDisplay(d);
 }
 
 void NSApplication::orderFrontStandardAboutPanel()
@@ -320,6 +522,17 @@ void NSWindow::setMainMenu(NSMenu *menu)
         QTimer::singleShot(0, m, [m] { m->update(); });
     });
     bar->addMenu(m);
+
+    /* the system menu bar shows the frontmost window's menus */
+    NSApplication *app = NSApplication::sharedApplication();
+    QVector<QPair<QString, QList<QAction *>>> menus;
+    for (QAction *a : bar->actions())
+        if (a->menu() && !a->isSeparator())
+            menus.append(qMakePair(a->text(), a->menu()->actions()));
+    NSMenu *appMenu = app->applicationMenu();
+    if (!appMenu) appMenu = lynxDefaultAppMenu(); /* the auto About/Quit */
+    const QByteArray json = lynxSerializeMenu(appMenu->qtActions(), menus);
+    lynxPublish(lynxAtom("_LYNX_GLOBAL_MENU"), win_->winId(), json);
 }
 
 void NSWindow::makeKeyAndOrderFront()
@@ -349,6 +562,11 @@ void NSMenuItem::setSubmenu(NSMenu *submenu)
     submenu_ = submenu;
 }
 
+void NSMenuItem::setEnabled(bool enabled)
+{
+    enabled_ = enabled;
+}
+
 NSMenu::NSMenu(const QString &title) : title_(title), bar_(nullptr)
 {
 }
@@ -367,6 +585,7 @@ void NSMenu::addItem(NSMenuItem *item)
     QAction *a = new QAction(item->title_);
     if (!item->key_.isEmpty())
         a->setShortcut(QKeySequence(item->key_));
+    a->setEnabled(item->enabled_);
     if (item->action_) {
         std::function<void()> fn = item->action_;
         QObject::connect(a, &QAction::triggered, [fn] { fn(); });
