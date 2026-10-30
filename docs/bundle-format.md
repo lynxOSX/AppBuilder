@@ -15,6 +15,24 @@ MyApp.app/
 `/Applications/<Name>.app` is how apps install (the skeleton creates
 `/Applications` — see rootFSBuilder's `scripts/apply-skel.sh`).
 
+## Preference panes (`[bundle] type = "prefPane"`)
+
+A System Preferences pane is the same bundle layout with a different
+package type: set `type = "prefPane"` in `[bundle]` and the project
+builds `<Name>.prefPane` with `CFBundlePackageType = "BNDL"` (and the
+icon also written to `NSPrefPaneIconFile`, the key System Preferences
+reads). The "executable" is a **shared library** — the pane's compiled
+view — placed in `Contents/lynxOS/` like an app's executable; it is
+dlopen()ed by System Preferences, which looks for panes in
+`/System/Library/PreferencePanes/`.
+
+A pane exports (extern "C", like the menu-extras ABI):
+
+| symbol | meaning |
+|---|---|
+| `lynxPrefPaneCreate()` | returns the pane's root `QWidget*` |
+| `lynxPrefPaneDestroy(QWidget*)` | destroys it before the library is closed |
+
 ## Info.json
 
 Written by `appbuilder build`, sorted and indented. Standard keys use the

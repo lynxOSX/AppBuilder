@@ -115,6 +115,22 @@ class Config:
     def icon(self):
         return self.bundle.get("icon", "AppIcon.png")
 
+    @property
+    def bundle_type(self):
+        """[bundle] type: "app" (default) or "prefPane" — a System
+        Preferences pane, installed at /System/Library/PreferencePanes/.
+        A prefPane's "executable" is a shared library loaded by System
+        Preferences; the bundle gets BNDL as its package type."""
+        t = self.bundle.get("type", "app")
+        if t not in ("app", "prefPane"):
+            die(f"{self.path}: [bundle] type must be \"app\" or \"prefPane\" "
+                f"(got {t!r})")
+        return t
+
+    @property
+    def suffix(self):
+        return ".prefPane" if self.bundle_type == "prefPane" else ".app"
+
     def _re(self, key, rx, what):
         v = self.bundle[key]
         if not isinstance(v, str) or not rx.match(v):
@@ -142,11 +158,15 @@ class Config:
             "CFBundleShortVersionString": self.version,
             "CFBundleVersion": self.build_number,
             "CFBundleExecutable": self.executable,
-            "CFBundlePackageType": "APPL",
+            "CFBundlePackageType": "BNDL" if self.bundle_type == "prefPane"
+                                   else "APPL",
             "CFBundleInfoDictionaryVersion": "6.0",
         }
         if self.icon:
             out["CFBundleIconFile"] = self.icon
+            if self.bundle_type == "prefPane":
+                # the key System Preferences reads for the pane's icon
+                out["NSPrefPaneIconFile"] = self.icon
         for k, v in self.info.items():
             if k in out:
                 warn(f"{self.path}: [info] '{k}' overrides a standard key")
@@ -290,7 +310,7 @@ def do_build(args):
     proj = find_project(args.project)
     cfg = Config(proj / "App.toml")
     out = Path(args.out).resolve() if args.out else proj / "out"
-    bundle = out / f"{cfg.name}.app"
+    bundle = out / f"{cfg.name}{cfg.suffix}"
     contents = bundle / "Contents"
 
     if bundle.exists():
@@ -325,7 +345,7 @@ def do_build(args):
 
 def do_check(args):
     target = Path(args.project).resolve()
-    if target.name.endswith(".app") or (target / "Contents").is_dir():
+    if target.name.endswith((".app", ".prefPane")) or (target / "Contents").is_dir():
         check_bundle(target)
         log(f"check: {target} is valid")
         return
